@@ -11,6 +11,7 @@
 template<typename T>
 class Ref
 {
+  // static assertions ensure no-throw move semantics for exception safety
   static_assert( std::is_nothrow_move_constructible_v<T> );
   static_assert( std::is_nothrow_move_assignable_v<T> );
 

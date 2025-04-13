@@ -18,10 +18,12 @@ T FileDescriptor::FDWrapper::CheckSystemCall( string_view s_attempt, T return_va
     return return_value;
   }
 
+  // in the no-blocking IO mode, EAGAIN and EINPROGRESS are not errors
+  // but rather a signal that the operation is not complete yet
   if ( non_blocking_ and ( errno == EAGAIN or errno == EINPROGRESS ) ) {
     return 0;
   }
-
+  
   throw unix_error { s_attempt };
 }
 
@@ -41,6 +43,8 @@ FileDescriptor::FDWrapper::FDWrapper( int fd ) : fd_( fd )
     throw runtime_error( "invalid fd number:" + to_string( fd ) );
   }
 
+  // get the current flags for the file descriptor
+  // and check if it is non-blocking
   const int flags = CheckSystemCall( "fcntl", fcntl( fd, F_GETFL ) ); // NOLINT(*-vararg)
   non_blocking_ = flags & O_NONBLOCK;                                 // NOLINT(*-bitwise)
 }
@@ -112,18 +116,27 @@ void FileDescriptor::read( vector<string>& buffers )
     return;
   }
 
+  // ensure last buffer has space for reading
   buffers.back().clear();
   buffers.back().resize( kReadBufferSize );
 
+  // prepare scatter/gather I/O structure for readv system call
   vector<iovec> iovecs;
   iovecs.reserve( buffers.size() );
   size_t total_size = 0;
+  
+  // populate iovec array with buffer addresses and sizes
   for ( const auto& x : buffers ) {
+    // const_cast needed because iovec expects non-const pointer, but string::data() is const
+    // Safe here because we're using mutable string buffers (NOLINT suppresses warning)
     iovecs.push_back( { const_cast<char*>( x.data() ), x.size() } ); // NOLINT(*-const-cast)
     total_size += x.size();
   }
 
+  // preform scatter read operation
   const ssize_t bytes_read = ::readv( fd_num(), iovecs.data(), static_cast<int>( iovecs.size() ) );
+  
+  // handle read error
   if ( bytes_read < 0 ) {
     if ( internal_fd_->non_blocking_ and ( errno == EAGAIN or errno == EINPROGRESS ) ) {
       buffers.clear();
@@ -134,10 +147,13 @@ void FileDescriptor::read( vector<string>& buffers )
 
   register_read();
 
+
+  // validate bytes read doesn't exceed total buffer capacity
   if ( bytes_read > static_cast<ssize_t>( total_size ) ) {
     throw runtime_error( "read() read more than requested" );
   }
 
+  // adjust buffer sizes based on actual bytes read
   size_t remaining_size = bytes_read;
   for ( auto& buf : buffers ) {
     if ( remaining_size >= buf.size() ) {
@@ -156,6 +172,7 @@ size_t FileDescriptor::write( string_view buffer )
 
 size_t FileDescriptor::write( const vector<Ref<string>>& buffers )
 {
+  // convert Ref<string> containers to string_views
   vector<string_view> views;
   views.reserve( buffers.size() );
   for ( const auto& x : buffers ) {
