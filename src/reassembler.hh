@@ -1,19 +1,19 @@
 #pragma once
 
 #include "byte_stream.hh"
+#include <map>
 
 class Reassembler
 {
 public:
   // Construct Reassembler to write into given ByteStream.
-  explicit Reassembler( ByteStream&& output ) : output_( std::move( output ) ) {}
+  explicit Reassembler( ByteStream&& output );
 
   /*
    * Insert a new substring to be reassembled into a ByteStream.
    *   `first_index`: the index of the first byte of the substring
    *   `data`: the substring itself
    *   `is_last_substring`: this substring represents the end of the stream
-   *   `output`: a mutable reference to the Writer
    *
    * The Reassembler's job is to reassemble the indexed substrings (possibly out-of-order
    * and possibly overlapping) back into the original ByteStream. As soon as the Reassembler
@@ -43,4 +43,8 @@ public:
 
 private:
   ByteStream output_;
+  uint64_t next_index_ = 0;                     // Index of the next byte to write
+  bool eof_ = false;                            // Whether we've seen the last substring
+  uint64_t eof_index_ = 0;                      // Index after the last byte in the stream
+  std::map<uint64_t, std::string> unassembled_; // Unassembled substrings
 };
