@@ -1,18 +1,15 @@
 #include "tcp_sender.hh"
-#include "debug.hh"
 #include "tcp_config.hh"
-
-#include <algorithm>
 
 using namespace std;
 
-// This function is for testing only; don't add extra state to support it.
+// Test accessor for outstanding sequence numbers
 uint64_t TCPSender::sequence_numbers_in_flight() const
 {
   return bytes_in_flight_;
 }
 
-// This function is for testing only; don't add extra state to support it.
+// Test accessor for retransmission counter
 uint64_t TCPSender::consecutive_retransmissions() const
 {
   return consecutive_retransmissions_;
@@ -20,201 +17,135 @@ uint64_t TCPSender::consecutive_retransmissions() const
 
 void TCPSender::push( const TransmitFunction& transmit )
 {
-  // calculate the current window size
-  // special case: treat window size of 0 as 1 for the purpose of sending
-  const uint16_t effective_window = window_size_ == 0 ? 1 : window_size_;
-  const uint64_t available_window = effective_window > bytes_in_flight_ ? effective_window - bytes_in_flight_ : 0;
+  // Calculate effective window size (treat 0 window as 1 for window probing)
+  const uint16_t effective_window = window_size_ ? window_size_ : 1;
 
-  // if the window size is 0, we cannot send any data
-  if ( available_window == 0 ) {
-    debug( "Window size is 0, cannot send data" );
-    return;
-  }
+  // Continue sending while window allows and FIN not yet sent
+  while ( bytes_in_flight_ < effective_window && !fin_sent_ ) {
+    TCPSenderMessage msg = make_empty_message();
 
-  // if we haven't send SYN yet, that's the first thing to send
-  if ( !syn_sent_ ) {
-    TCPSenderMessage syn_msg;
-    syn_msg.seqno = isn_;  // Use the ISN directly for first segment
-    syn_msg.SYN = true;
-
-    // update state;
-    syn_sent_ = true;
-    next_seqno_ += 1; // SYN consumes one sequence number
-    bytes_in_flight_ += 1;
-
-    // store the outstanding segment
-    outstanding_segments_.push( { syn_msg, total_time_elapsed_ms_ } );
-
-    // send the SYN message
-    transmit( syn_msg );
-
-    // start the timer if it's not running
-    if ( !timer_running_ ) {
-      timer_running_ = true;
-      time_last_segment_sent_ms_ = total_time_elapsed_ms_;
-    }
-    return; // only send SYN in this call
-  }
-
-  // try to fill the window with data segments
-  uint64_t current_available_window = available_window;
-  while ( current_available_window > 0 ) {
-    // determine if we can add FIN (if stream is closed but FIN not yet sent)
-    const bool can_add_fin = input_.writer().is_closed() && !fin_sent_;
-
-    // check if we have data to read
-    const bool has_data = input_.reader().bytes_buffered() > 0;
-
-    // if no data and can't send FIN we're done
-    if ( !has_data && !can_add_fin ) {
-      debug( "No data to send and FIN not set, stopping" );
-      break;
+    // Set SYN flag if connection not yet initiated
+    if ( !syn_sent_ ) {
+      msg.SYN = true;
+      syn_sent_ = true;
     }
 
-    // create a new message
-    TCPSenderMessage msg;
-    msg.seqno = Wrap32(next_seqno_);
+    // Calculate available payload space considering window and existing flight
+    const uint64_t remaining_capacity = effective_window - bytes_in_flight_;
+    const size_t max_payload = min( remaining_capacity - msg.sequence_length(), // Account for SYN/FIN
+                                    TCPConfig::MAX_PAYLOAD_SIZE );
 
-    // calculate how much data we can include in this segment
-    uint64_t payload_size
-      = min( current_available_window,
-             min( static_cast<uint64_t>( TCPConfig::MAX_PAYLOAD_SIZE ), input_.reader().bytes_buffered() ) );
-
-    // read data from the stream if we can send some
-    if ( payload_size > 0 ) {
-      string data;
-      read( input_.reader(), payload_size, data );
-      msg.payload = data;
+    // Fill payload from input stream without exceeding capacity
+    while ( reader().bytes_buffered() && msg.payload.size() < max_payload ) {
+      const string_view data = reader().peek().substr( 0, max_payload - msg.payload.size() );
+      msg.payload += data;
+      reader().pop( data.size() );
     }
 
-    // add FIN if appropriate (stream closed, FIN not sent yet, and room in window)
-    if ( can_add_fin && ( msg.payload.size() + 1 <= current_available_window ) ) {
+    // Set FIN flag if stream ended and window allows
+    if ( !fin_sent_ && reader().is_finished() && ( remaining_capacity > msg.sequence_length() ) ) {
       msg.FIN = true;
       fin_sent_ = true;
     }
 
-    // get the sequence length of this segment
-    const size_t sequence_length = msg.sequence_length();
-
-    // don't send empty segments
-    if ( sequence_length == 0 ) {
-      debug( "Empty segment, not sending" );
+    // Skip empty segments (except for SYN/FIN)
+    if ( msg.sequence_length() == 0 )
       break;
-    }
 
-    // update state
-    next_seqno_ += sequence_length;
-    bytes_in_flight_ += sequence_length;
-
-    // store the outstanding segment
-    outstanding_segments_.push( { msg, total_time_elapsed_ms_ } );
-
-    // send the message
+    // Transmit segment and update tracking
     transmit( msg );
+    next_seqno_ += msg.sequence_length();
+    bytes_in_flight_ += msg.sequence_length();
+    outstanding_messages_.push( move( msg ) );
 
-    // start the timer if it's not running
+    // Start retransmission timer if not running
     if ( !timer_running_ ) {
       timer_running_ = true;
-      time_last_segment_sent_ms_ = total_time_elapsed_ms_;
+      timer_ = 0;
     }
-    
-    // Update available window for next iteration
-    if (sequence_length >= current_available_window) {
-      break;
-    }
-    current_available_window -= sequence_length;
   }
 }
 
 TCPSenderMessage TCPSender::make_empty_message() const
 {
-  // create an empty message with the current sequence number
-  TCPSenderMessage msg;
-  msg.seqno = Wrap32( next_seqno_ );
-  return msg;
+  // Construct base message with current sequence number
+  return {
+    .seqno = Wrap32::wrap( next_seqno_, isn_ ),
+    .SYN = false,
+    .payload = {},
+    .FIN = false,
+    .RST = input_.has_error() // Propagate stream error state
+  };
 }
 
 void TCPSender::receive( const TCPReceiverMessage& msg )
 {
-  // update window size from receiver's message
+  // Handle error states
+  if ( input_.has_error() )
+    return;
+  if ( msg.RST ) {
+    input_.set_error();
+    return;
+  }
+
+  // Update receiver window size
   window_size_ = msg.window_size;
 
-  // process acknowledgement number if present
-  if ( msg.ackno.has_value()) {
-    // Get the wrapped ackno value
-    Wrap32 wrapped_ackno = msg.ackno.value();
-    
-    // Calculate the absolute (unwrapped) ackno value
-    uint64_t abs_ackno = wrapped_ackno.unwrap(isn_, next_seqno_);
-    
-    // Check if the abs_ackno is greater than next_seqno_ (impossible ackno)
-    if (abs_ackno > next_seqno_) {
-      // Ignore impossible acknos completely
-      debug("Ignoring impossible ackno that's beyond next_seqno");
-      return;
-    }
-    
-    // Only process if this is a new ackno
-    if (abs_ackno > ackno_) {
-      // update our record of the highest acknowledged sequence number
-      ackno_ = abs_ackno;
+  // Process acknowledgment if present
+  if ( !msg.ackno )
+    return;
 
-      // new acknowledgement received - reset RTO to initial value
-      current_RTO_ms_ = initial_RTO_ms_;
+  // Convert relative ackno to absolute sequence space
+  const uint64_t ack_abs = msg.ackno->unwrap( isn_, next_seqno_ );
 
-      // reset retransmission counter since we got a new ack
-      consecutive_retransmissions_ = 0;
+  // Validate acknowledgment number
+  if ( ack_abs > next_seqno_ )
+    return; // Acknowledges unsent data
 
-      // remove acknowledged segments from the queue
-      while ( !outstanding_segments_.empty() ) {
-        const auto& segment = outstanding_segments_.front();
-        const uint64_t segment_seqno = segment.message.seqno.unwrap( isn_, next_seqno_ );
-        const uint64_t segment_end = segment_seqno + segment.message.sequence_length();
+  bool acked = false;
+  // Process all completely acknowledged segments
+  while ( !outstanding_messages_.empty() ) {
+    const auto& front_msg = outstanding_messages_.front();
+    const uint64_t segment_end = ackno_ + front_msg.sequence_length();
 
-        // if this segment is fully acknowledged, remove it
-        if ( segment_end <= abs_ackno ) {
-          bytes_in_flight_ -= segment.message.sequence_length();
-          outstanding_segments_.pop();
-        } else {
-          break; // stop processing if we reach a segment that is not fully acknowledged
-        }
-      }
+    if ( segment_end > ack_abs )
+      break; // Partial acknowledgment
 
-      // update timer state
-      if ( outstanding_segments_.empty() ) {
-        // if no more outstanding segments, stop the timer
-        timer_running_ = false;
-      } else if ( timer_running_ ) {
-        // if timer was running and we received new ACK but still have segments, restart timer
-        time_last_segment_sent_ms_ = total_time_elapsed_ms_;
-      }
-    }
+    // Update tracking information
+    acked = true;
+    ackno_ = segment_end;
+    bytes_in_flight_ -= front_msg.sequence_length();
+    outstanding_messages_.pop();
+  }
+
+  // Reset timer state if any segments were acknowledged
+  if ( acked ) {
+    timer_ = 0;
+    current_RTO_ms_ = initial_RTO_ms_;
+    consecutive_retransmissions_ = 0;
+    timer_running_ = !outstanding_messages_.empty();
   }
 }
 
 void TCPSender::tick( uint64_t ms_since_last_tick, const TransmitFunction& transmit )
 {
-  // update the total elapsed time
-  total_time_elapsed_ms_ += ms_since_last_tick;
+  // Update timer only when active
+  if ( timer_running_ ) {
+    timer_ += ms_since_last_tick;
+  }
 
-  // check if the retransmission timer is running and we have outstanding segments
-  if ( timer_running_ && !outstanding_segments_.empty() ) {
-    // check if the timer has expired
-    if ( total_time_elapsed_ms_ - time_last_segment_sent_ms_ >= current_RTO_ms_ ) {
-      // retransmit the first segment in the queue
-      transmit( outstanding_segments_.front().message );
+  // Check for timeout condition
+  if ( timer_running_ && timer_ >= current_RTO_ms_ && !outstanding_messages_.empty() ) {
+    // Retransmit oldest unacknowledged segment
+    transmit( outstanding_messages_.front() );
 
-      // only update retransmission count and double RTO if window size is not zero
-      if ( window_size_ > 0 ) {
-        // increment the consecutive retransmission count
-        consecutive_retransmissions_++;
-
-        // exponential backoff: double the RTO
-        current_RTO_ms_ *= 2;
-      }
-
-      // reset the timer
-      time_last_segment_sent_ms_ = total_time_elapsed_ms_;
+    // Apply exponential backoff only when window is open
+    if ( window_size_ > 0 ) {
+      consecutive_retransmissions_++;
+      current_RTO_ms_ *= 2;
     }
+
+    // Reset timer for next potential retransmission
+    timer_ = 0;
   }
 }
