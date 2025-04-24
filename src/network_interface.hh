@@ -98,6 +98,8 @@ private:
 
   // ARP cache: maps IP addresses to Ethernet addresses
   std::unordered_map<AddressNumber, ArpEntry> arp_cache_ {};
+  // Pending datagrams: maps IP addresses to datagrams waiting for ARP replies
   std::unordered_map<AddressNumber, std::vector<InternetDatagram>> pending_datagrams_ {};
+  // Pending datagram timers: maps IP addresses to timers for retransmitting ARP requests
   std::unordered_map<AddressNumber, Timer> pending_datagram_timers_ {};
 };
