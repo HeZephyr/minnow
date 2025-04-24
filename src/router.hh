@@ -34,4 +34,15 @@ public:
 private:
   // The router's collection of network interfaces
   std::vector<std::shared_ptr<NetworkInterface>> interfaces_ {};
+
+  struct RouteEntry {
+    size_t interface_num {};
+    std::optional<Address> next_hop {};
+  };
+  
+  // Routing table, sorted by prefix length (up to 32 groups)
+  std::array<std::unordered_map<uint32_t, RouteEntry>, 32> routing_table_ {};
+
+  // Find matching route entries (longest prefix match)
+  std::optional<RouteEntry> match( uint32_t ) const noexcept;
 };
