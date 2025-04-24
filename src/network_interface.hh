@@ -6,6 +6,7 @@
 
 #include <memory>
 #include <queue>
+#include <unordered_map>
 
 // A "network interface" that connects IP (the internet layer, or network layer)
 // with Ethernet (the network access layer, or link layer).
@@ -82,4 +83,21 @@ private:
 
   // Datagrams that have been received
   std::queue<InternetDatagram> datagrams_received_ {};
+
+  // ARP entry validity period and retransmission interval (30s / 5s recommended by RFC826)
+  static constexpr size_t ARP_ENTRY_TTL_ms      = 30'000;  // 30 s
+  static constexpr size_t ARP_REQUEST_PERIOD_ms = 5'000;   // 5 s
+  using Timer = uint64_t;
+  using AddressNumber = uint32_t;
+
+  struct ArpEntry
+  {
+    EthernetAddress ethernet_address;
+    Timer timer;
+  };
+
+  // ARP cache: maps IP addresses to Ethernet addresses
+  std::unordered_map<AddressNumber, ArpEntry> arp_cache_ {};
+  std::unordered_map<AddressNumber, std::vector<InternetDatagram>> pending_datagrams_ {};
+  std::unordered_map<AddressNumber, Timer> pending_datagram_timers_ {};
 };
